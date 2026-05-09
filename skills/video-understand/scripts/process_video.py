@@ -631,41 +631,50 @@ def process_with_ffmpeg(
 # === Provider-specific processors ===
 
 def process_with_gemini(source: str, prompt: str, model: str = None, is_url: bool = False, verbose: bool = True) -> dict:
-    """Process video with Google Gemini."""
-    import google.generativeai as genai
+    """Process video with Google Gemini (google-genai SDK).
+
+    Patched 2026-05-09: migrated from deprecated google.generativeai to google-genai
+    so that YouTube URL ingestion via FileData(file_uri=...) works correctly.
+    """
+    from google import genai
+    from google.genai import types
 
     model_name = model or DEFAULT_MODELS["gemini"]
     log(f"Processing with Gemini ({model_name})...", verbose)
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    genai.configure(api_key=api_key)
-
-    genai_model = genai.GenerativeModel(model_name)
+    client = genai.Client(api_key=api_key)
 
     if is_url and is_youtube_url(source):
-        # Gemini can handle YouTube URLs directly
+        # Gemini natively ingests YouTube URLs through FileData
         log("Sending YouTube URL directly to Gemini...", verbose)
-        response = genai_model.generate_content([
-            prompt,
-            {"video_url": source}
-        ])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=types.Content(parts=[
+                types.Part(file_data=types.FileData(file_uri=source, mime_type="video/*")),
+                types.Part(text=prompt),
+            ]),
+        )
     else:
-        # Upload local file
+        # Upload local file via File API, then reference it
         log("Uploading video to Gemini...", verbose)
-        video_file = genai.upload_file(source)
+        uploaded = client.files.upload(file=source)
 
-        # Wait for processing
+        # Wait for processing if Gemini reports PROCESSING state
         import time
-        while video_file.state.name == "PROCESSING":
+        while getattr(uploaded.state, "name", "ACTIVE") == "PROCESSING":
             log("Waiting for Gemini to process video...", verbose)
             time.sleep(2)
-            video_file = genai.get_file(video_file.name)
+            uploaded = client.files.get(name=uploaded.name)
 
-        if video_file.state.name == "FAILED":
-            raise RuntimeError(f"Video processing failed: {video_file.state.name}")
+        if getattr(uploaded.state, "name", "ACTIVE") == "FAILED":
+            raise RuntimeError(f"Video processing failed: {uploaded.state.name}")
 
         log("Generating response...", verbose)
-        response = genai_model.generate_content([prompt, video_file])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[uploaded, prompt],
+        )
 
     return {
         "provider": "gemini",
